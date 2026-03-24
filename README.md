@@ -1,181 +1,128 @@
 # claude-sync
 
-Sync your [Claude Code](https://claude.com/claude-code) configuration across machines over SSH.
+Sync your [Claude Code](https://claude.com/claude-code) configuration and projects across machines. No SSH, no passwords, no credential managers needed — just filesystem mounts and Syncthing.
 
-Claude Code's `.claude/` directory stores your project memory, rules, agents, skills, hooks, and MCP configs — but none of it syncs across devices. **claude-sync** fixes that.
+## Architecture
 
-## What it syncs
+**Claude config** (`~/.claude/`) syncs via **Syncthing** — bidirectional, automatic, conflict-free. Rules, skills, hooks, memory, and settings stay in sync across all your machines without lifting a finger.
 
-| Item | What it is |
-|------|-----------|
-| `settings.json` | Plugins, hooks, permissions, preferences |
-| `rules/` | Modular instruction files (path-scoped or global) |
-| `agents/` | Custom agent definitions |
-| `skills/` | Custom skill workflows |
-| `commands/` | Custom slash commands |
-| `hooks/` | Hook scripts |
-| `.mcp.json` | MCP server configurations |
+**Code projects** live on a **NAS** (the canonical copy). Machines that need fast local builds (e.g., macOS over SMB) keep a local copy in `~/Documents/projects/` and use rsync to pull/push.
+
+```
+┌──────────────┐    Syncthing     ┌──────────────┐
+│   Desktop    │ ◄──────────────► │   MacBook    │
+│  ~/.claude/  │   (automatic)    │  ~/.claude/  │
+└──────┬───────┘                  └──────┬───────┘
+       │                                 │
+       │ NFS mount                       │ SMB mount
+       │ (direct access)                 │ (or local copy via rsync)
+       │                                 │
+       └──────────┐   ┌─────────────────┘
+                  ▼   ▼
+            ┌─────────────┐
+            │     NAS     │
+            │  /projects  │
+            └─────────────┘
+```
+
+### Why this design?
+
+| Layer | Tool | Why |
+|-------|------|-----|
+| Claude config | Syncthing | Small files, bidirectional, instant propagation, handles conflicts |
+| Projects | NAS + rsync | Large repos with build artifacts; NFS gives native speed on Linux, rsync gives fast local copies on Mac |
+| Network | Tailscale subnet routing | Works on LAN, coffee shop, anywhere with wifi — NAS is always reachable |
 
 ## Install
 
 ```bash
-git clone https://github.com/aparcedodev/claude-sync.git
+git clone https://github.com/Josue7211/claude-sync.git
 cd claude-sync
-./install.sh
+./claude-sync setup
 ```
 
-Or copy the script directly:
+Or manually:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aparcedodev/claude-sync/main/claude-sync -o ~/.local/bin/claude-sync
+curl -fsSL https://raw.githubusercontent.com/Josue7211/claude-sync/main/claude-sync \
+  -o ~/.local/bin/claude-sync
 chmod +x ~/.local/bin/claude-sync
 ```
 
 ### Requirements
 
-- `bash`, `python3`, `rsync`, `ssh`
-- `sshpass` (only if using password auth)
+- `bash`, `rsync`, `python3`, `curl`
+- [Syncthing](https://syncthing.net/) — for Claude config sync
+- NAS mounted via NFS (Linux) or SMB (macOS)
+- [Tailscale](https://tailscale.com/) — optional, for remote access to NAS
 
-## Quick start
+### NAS setup
 
+Mount your NAS projects directory so claude-sync can find it:
+
+**Linux (NFS):**
 ```bash
-# Initialize config
-claude-sync init
-
-# Add a target machine
-claude-sync add macbook --host 192.168.1.50 --user me --password mypass
-
-# Or with SSH key auth (no --password)
-claude-sync add server --host 10.0.0.5 --user deploy
-
-# Push your config
-claude-sync push
-
-# Push to a specific target
-claude-sync push macbook
-
-# Check what's different
-claude-sync diff macbook
-
-# See full status
-claude-sync status
+# /etc/fstab
+<NAS_IP>:/path/to/projects  /mnt/storage/projects  nfs  defaults  0  0
 ```
 
-## How it works
-
+**macOS (SMB):**
 ```
-┌─────────────────┐         SSH/rsync          ┌─────────────────┐
-│  Source Machine  │ ────────────────────────▶   │  Target Machine  │
-│                  │                             │                  │
-│  ~/.claude/      │         push                │  ~/.claude/      │
-│  ├── settings    │ ──────────────────────────▶ │  ├── settings    │
-│  ├── rules/      │  (paths auto-rewritten)     │  ├── rules/      │
-│  ├── agents/     │                             │  ├── agents/     │
-│  ├── skills/     │                             │  ├── skills/     │
-│  └── hooks/      │                             │  └── hooks/      │
-│                  │                             │                  │
-│  ~/.mcp.json     │ ──────────────────────────▶ │  ~/.mcp.json     │
-└─────────────────┘                             └─────────────────┘
+Finder → Go → Connect to Server → smb://<NAS_IP>/projects
 ```
 
-### Path mappings
+Or mount at `/Volumes/projects` or `/Volumes/Media/projects` — claude-sync auto-detects both.
 
-When syncing between Linux and macOS (or any two machines with different home directories), paths in `settings.json` are automatically rewritten. For example:
+### Syncthing setup
 
-- `/home/alice/.claude/hooks/` → `/Users/alice/.claude/hooks/`
-
-This is configured per target and auto-detected during `claude-sync add`.
-
-## Configuration
-
-Config lives at `~/.config/claude-sync/config.json`:
-
-```json
-{
-  "source": {
-    "claudeDir": "/home/user/.claude",
-    "mcpJson": "/home/user/.mcp.json"
-  },
-  "sync": [
-    "settings.json",
-    "rules",
-    "agents",
-    "skills",
-    "commands",
-    "hooks",
-    ".mcp.json"
-  ],
-  "targets": {
-    "macbook": {
-      "host": "192.168.1.50",
-      "user": "me",
-      "auth": "password",
-      "password": "mypass",
-      "port": 22,
-      "remoteHome": "/Users/me",
-      "pathMappings": {
-        "/home/user/": "/Users/me/"
-      }
-    }
-  }
-}
-```
-
-### Customizing what syncs
-
-Edit the `sync` array to add or remove items. Any path relative to `~/.claude/` works:
-
-```json
-{
-  "sync": [
-    "settings.json",
-    "rules",
-    "agents",
-    "skills",
-    "commands",
-    "hooks",
-    ".mcp.json",
-    "todos"
-  ]
-}
-```
+1. Install Syncthing on all machines
+2. Share your `~/.claude/` folder between them
+3. That's it — claude-sync detects the Syncthing folder automatically
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `init` | Create config file |
-| `add <name>` | Add a sync target |
-| `remove <name>` | Remove a target |
-| `list` | Show targets with online/offline status |
-| `push [target]` | Sync to all targets (or one) |
-| `push --dry-run` | Preview what would sync |
-| `diff <target>` | Compare local vs remote |
-| `status` | Full status overview |
+| `claude-sync` | Force Syncthing to rescan `~/.claude/` (immediate sync) |
+| `claude-sync pull-projects` | NAS → local copy (get latest before working) |
+| `claude-sync push-projects` | Local copy → NAS (push changes back) |
+| `claude-sync status` | Show Syncthing state, config file counts, NAS mount status |
+| `claude-sync setup` | First-time setup: create dirs, symlink to PATH, check Syncthing |
 
-## Why not just use dotfiles/git?
+## How it works
 
-You could commit `.claude/` to a dotfiles repo, but:
+### Claude config (`claude-sync`)
 
-- **`settings.json` contains machine-specific paths** (hook scripts, etc.) that differ between Linux/macOS
-- **MCP server configs may reference local services** with different IPs per network
-- **You'd need to manually pull on each machine** after every change
+Triggers a Syncthing rescan of the `~/.claude/` folder. Syncthing handles the rest — bidirectional sync to all connected devices. Your rules, skills, hooks, memory, agents, and CLAUDE.md stay identical everywhere.
 
-claude-sync handles path rewriting automatically and pushes in one command.
+### Project sync (`pull-projects` / `push-projects`)
 
-## CLAUDE.md sync
+Uses rsync with smart excludes (`node_modules/`, `target/`, `.next/`, `build/`, `dist/`, `.dart_tool/`, `ios/Pods/`, etc.) to copy projects between NAS and a local directory.
 
-claude-sync handles config files. For `CLAUDE.md` (project instructions), the recommended approach is:
+- **Desktop (Linux + NFS):** Works directly on the NAS mount — no copy needed. `pull-projects` detects this and skips.
+- **MacBook (SMB):** SMB is too slow for builds (especially Cargo, Flutter). `pull-projects` copies to `~/Documents/projects/` for native speed. `push-projects` syncs changes back.
 
-1. Store a master `CLAUDE.md` on shared storage (NAS, cloud drive, etc.)
-2. Each machine's `~/.claude/CLAUDE.md` imports it:
+### Status (`status`)
 
-```markdown
-# User-Level Instructions
-@/path/to/shared/CLAUDE.md
-```
+Shows:
+- Syncthing running state
+- Number of rules, skills, hooks, and project memories
+- NAS mount status and project counts
+- Local copy status
 
-This way instructions stay in sync without copying files.
+## Migrating from v1
+
+v1 used SSH + sshpass to push config between machines. v2 replaces all of that:
+
+| | v1 | v2 |
+|--|----|----|
+| Config sync | SSH push (one-directional) | Syncthing (bidirectional, automatic) |
+| Project sync | Not supported | NAS mounts + rsync |
+| Auth | SSH keys or passwords | None (filesystem mounts) |
+| Config file | `~/.config/claude-sync/config.json` | Not needed (auto-detects everything) |
+| Dependencies | `ssh`, `sshpass` | `syncthing`, `rsync` |
+
+You can safely delete `~/.config/claude-sync/` after upgrading.
 
 ## License
 
